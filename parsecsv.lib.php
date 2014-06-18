@@ -424,6 +424,36 @@ class parseCSV implements Iterator {
     protected $length = 4096;
     protected $escape = '\\';
     protected $line_separator; // For UTF-16LE it's multibyte, e.g. 0x0A00
+    
+    // new and merged
+    /**
+     * Read Mode
+     * Set whether files should be read as a whole or piece by piece for systems with low memory
+     * Possible values: ["whole", "chunked"]
+     *
+     * @access public
+     * @var string
+     */
+    public $read_mode = 'whole';
+    
+    /**
+     * Write Mode
+     * Set whether files should be written as a whole or piece by piece for systems with low memory
+     * Possible values: ["whole", "chunked"]
+     *
+     * @access public
+     * @var string
+     */
+    public $write_mode = 'whole';
+    
+    /**
+     * Position
+     * Iterator position in $this->data
+     *
+     * @access protected
+     * @var int
+     */
+    public $position = 0;
 
 
     /**
@@ -436,7 +466,7 @@ class parseCSV implements Iterator {
      * @param  [integer] limit      Limits the number of returned rows to specified amount
      * @param  [string]  conditions Basic SQL-like conditions for row matching
      */
-    public function __construct ($input = null, $offset = null, $limit = null, $conditions = null, $keep_file_data = null) {
+    public function __construct ($input = null, $offset = null, $limit = null, $conditions = null, $keep_file_data = null, $read_mode = null, $write_mode = null) {
         if (!is_null($offset)) {
             $this->offset = $offset;
         }
@@ -453,7 +483,7 @@ class parseCSV implements Iterator {
         	$this->keep_file_data = $keep_file_data;
         }
 
-        if (!empty($input)) {
+        if (!is_null($input)) {
             $this->parse($input);
         }
     }
@@ -854,7 +884,7 @@ class parseCSV implements Iterator {
             $input = $this->file;
         }
 
-        if (!empty($input)) {
+        if ((is_string($input) && !empty($input)) || is_resource($input)) {
             if (!is_null($offset)) {
                 $this->offset = $offset;
             }
@@ -867,12 +897,22 @@ class parseCSV implements Iterator {
                 $this->conditions = $conditions;
             }
 
-            if (is_readable($input)) {
+            if (is_string($input)) {
+                if (is_readable($input)) {
+                    $this->own_h = true;
+                    $this->data = $this->parse_file($input);
+                }
+                else {
+                    $this->file_data = &$input;
+                    $this->data      = $this->parse_string();
+                }
+            }
+            else if (is_resource($input)) {
+                $this->own_h = false;
                 $this->data = $this->parse_file($input);
             }
             else {
-                $this->file_data = &$input;
-                $this->data      = $this->parse_string();
+                throw new \InvalidArgumentException(gettype($input) . ' is not a legal file argument type');
             }
 
             if ($this->data === false) {
@@ -1349,6 +1389,9 @@ class parseCSV implements Iterator {
         elseif (file_exists($input)) {
             $file = $input;
         }
+        else if (is_resource($input)) {
+            $file = $input;
+        }
         else {
             $data = $input;
         }
@@ -1614,12 +1657,17 @@ class parseCSV implements Iterator {
      */
     protected function _rfile ($file = null) {
         if (is_readable($file)) {
-            if (!($fh = fopen($file, 'r'))) {
+            if (!($this->h = fopen($file, 'r'))) {
                 return false;
             }
 
-            $data = fread($fh, filesize($file));
-            fclose($fh);
+            $data = fread($this->h, filesize($file));
+            fclose($this->h);
+            return $data;
+        }
+        else if (is_resource($file)) {
+            $this->h = $file;
+            $data = fread($this->h, filesize($file));
             return $data;
         }
 
@@ -1749,7 +1797,8 @@ class parseCSV implements Iterator {
         else {
             // Not using fgetcsv() because it is dependent on the locale setting.
             $line = stream_get_line($this->h, $this->length, $this->line_separator);
-            if (($line === false) || feof($this->h)) { // feof() check is needed for PHP < 5.4.4 because stream_get_line() kept returning an empty string instead of false at eof.
+            //if (($line === false) || feof($this->h)) { // feof() check is needed for PHP < 5.4.4 because stream_get_line() kept returning an empty string instead of false at eof.
+            if (($line === false)) { // testing on 2014-06-17 with PHP 5.4.12, the feof()-fix results in the last row of a csv being ignored hence not parsed - without it seems to be working fine so far
                 return false;
             }
             //$this->debug && error_log(__METHOD__ . ' read line: ' . bin2hex($line));
@@ -1769,6 +1818,7 @@ class parseCSV implements Iterator {
             }
         }
         $csv = str_getcsv($line, $this->delimiter, $this->enclosure, $this->escape);
+        // TODO: nicht str_getcsv() verwenden sondern $this->parse_string() oder ähnliche Funktion erschaffen
         if (!$csv || (is_null($csv[0]) && (count($csv) == 1))) {
             return array();
         }
@@ -1840,7 +1890,12 @@ class parseCSV implements Iterator {
      * Required Iterator interface method.
      */
     public function current() {
-        return $this->row;
+        if ($this->read_mode == 'chunked') {
+            return $this->row;
+        }
+        else {
+            return $this->data[$this->position];
+        }
     }
     
     
@@ -1848,7 +1903,12 @@ class parseCSV implements Iterator {
      * Required Iterator interface method.
      */
     public function key() {
-        return $this->key;
+        if ($this->read_mode == 'chunked') {
+            return $this->key;
+        }
+        else {
+            return $this->position;
+        }
     }
     
     
@@ -1856,7 +1916,12 @@ class parseCSV implements Iterator {
      * Required Iterator interface method.
      */
     public function next() {
-        $this->_read();
+        if ($this->read_mode == 'chunked') {
+            $this->_read();
+        }
+        else {
+            ++$this->position;
+        }
     }
     
     
@@ -1864,17 +1929,22 @@ class parseCSV implements Iterator {
      * Required Iterator interface method.
      */
     public function rewind() {
-        if (!$this->seekable) { // rewind() is called whenever a foreach loop is started.
-            return; // Just return without a warning/error.
+        if ($this->read_mode == 'chunked') {
+            if (!$this->seekable) { // rewind() is called whenever a foreach loop is started.
+                return; // Just return without a warning/error.
+            }
+            if (fseek($this->h, $this->bom_len) != 0) {
+                throw new \Exception('Failed to fseek to ' . $this->bom_len);
+            }
+            $this->row = null;
+            $this->key = -1;
+            $this->initial_lines_index == 0;
+            if ($this->_fgetcsv()) { // skip header row
+                $this->_read();
+            }
         }
-        if (fseek($this->h, $this->bom_len) != 0) {
-            throw new \Exception('Failed to fseek to ' . $this->bom_len);
-        }
-        $this->row = null;
-        $this->key = -1;
-        $this->initial_lines_index == 0;
-        if ($this->_fgetcsv()) { // skip header row
-            $this->_read();
+        else {
+            $this->position = 0;
         }
     }
     
@@ -1891,7 +1961,12 @@ class parseCSV implements Iterator {
      * Required Iterator interface method.
      */
     public function valid() {
-        return !is_null($this->row);
+        if ($this->read_mode == 'chunked') {
+            return !is_null($this->row);
+        }
+        else {
+            return isset($this->data[$this->position]);
+        }
     }
 }
 
